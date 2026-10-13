@@ -20,3 +20,7 @@ description = "t:description"
   [extensions.build]
   command = ""
   path = "dist/function.wasm"
+
+  [extensions.input.variables]
+  namespace = "$app"
+  key = "tier_customer_tags"

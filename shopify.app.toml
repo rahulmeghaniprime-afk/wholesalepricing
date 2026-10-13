@@ -22,7 +22,7 @@ api_version = "2026-10"
 
 [access_scopes]
 # Learn more at https://shopify.dev/docs/apps/tools/cli/configuration#access_scopes
-scopes = "write_products,write_metaobjects,write_metaobject_definitions"
+scopes = "write_products,write_metaobjects,write_metaobject_definitions,write_discounts"
 
 [auth]
 redirect_urls = [ "https://example.com/api/auth" ]
@@ -94,4 +94,11 @@ type = "number_integer"
 name = "B2B Pricing Min Quantity"
 
   [variant.metafields.app.b2b_pricing_min.access]
+  admin = "merchant_read_write"
+
+[discount.metafields.app.tier_customer_tags]
+type = "json"
+name = "B2B Tier Customer Tags"
+
+  [discount.metafields.app.tier_customer_tags.access]
   admin = "merchant_read_write"

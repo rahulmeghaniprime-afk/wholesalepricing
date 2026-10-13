@@ -1,15 +1,41 @@
-query CartInput {
+query CartInput(
+  $tags: [String!] = []
+  $priceKey: String = "vip_pricing"
+  $qtyKey: String = "vip_pricing_min"
+) {
   cart {
+    buyerIdentity {
+      customer {
+        vip_tag: hasAnyTag(tags: ["VIP"])
+        con_tag: hasAnyTag(tags: $tags)
+      }
+    }
     lines {
       id
+      quantity
       cost {
         subtotalAmount {
           amount
         }
       }
+      merchandise {
+        ... on ProductVariant {
+          id
+          b2b_price: metafield(namespace: "$app", key: $priceKey) {
+            value
+          }
+          b2b_min: metafield(namespace: "$app", key: $qtyKey) {
+            value
+          }
+        }
+      }
     }
   }
+  presentmentCurrencyRate
   discount {
     discountClasses
+    tier_tags: metafield(namespace: "$app", key: "tier_customer_tags") {
+      value
+    }
   }
 }

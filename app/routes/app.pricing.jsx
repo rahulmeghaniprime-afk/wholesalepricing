@@ -255,51 +255,110 @@ export const loader = async ({ request }) => {
   const tierId = url.searchParams.get("id");
   const after = url.searchParams.get("after") || null;
 
-  const response = await admin.graphql(
-    `#graphql
-      query GetPricingData($after: String) {
-        shop { currencyCode }
-        metafieldDefinitions(first: 100, namespace: "$app", ownerType: PRODUCTVARIANT) {
-          nodes { id key name type { name } }
-        }
-        products(first: 50, after: $after) {
-          pageInfo {
-            hasNextPage
-            hasPreviousPage
-            startCursor
-            endCursor
+  // Fetch products + metafield definitions + customer tags in parallel
+  const [productsResponse, customerTagsResponse] = await Promise.all([
+    admin.graphql(
+      `#graphql
+        query GetPricingData($after: String) {
+          shop { currencyCode }
+          metafieldDefinitions(first: 100, namespace: "$app", ownerType: PRODUCTVARIANT) {
+            nodes { id key name type { name } }
           }
-          nodes {
-            id title
-            media(first: 1) { nodes { preview { image { url } } } }
-            priceRangeV2 {
-              maxVariantPrice { amount }
-              minVariantPrice { amount }
+          products(first: 50, after: $after) {
+            pageInfo {
+              hasNextPage
+              hasPreviousPage
+              startCursor
+              endCursor
             }
-            variantsCount { count }
-            variants(first: 100) {
-              nodes {
-                id title price
-                metafields(namespace: "$app", first: 100) {
-                  nodes { id key type value }
-                }
+            nodes {
+              id title
+              media(first: 1) { nodes { preview { image { url } } } }
+              priceRangeV2 {
+                maxVariantPrice { amount }
+                minVariantPrice { amount }
               }
-              pageInfo { endCursor hasNextPage hasPreviousPage startCursor }
+              variantsCount { count }
+              variants(first: 100) {
+                nodes {
+                  id title price
+                  metafields(namespace: "$app", first: 100) {
+                    nodes { id key type value }
+                  }
+                }
+                pageInfo { endCursor hasNextPage hasPreviousPage startCursor }
+              }
             }
           }
         }
-      }
-    `,
-    { variables: { after } }
-  );
+      `,
+      { variables: { after } }
+    ),
+    // Fetch all customer tags for the tag picker
+    admin.graphql(
+      `#graphql
+        query GetAllCustomerTags {
+          shop {
+            customerTags(first: 250) {
+              nodes
+            }
+          }
+        }
+      `
+    ),
+  ]);
 
-  const data = await response.json();
+  const [data, tagsData] = await Promise.all([
+    productsResponse.json(),
+    customerTagsResponse.json(),
+  ]);
+
   const defs = data?.data?.metafieldDefinitions?.nodes ?? [];
   const tierGid = `gid://shopify/MetafieldDefinition/${tierId}`;
   const tierDef = defs.find((d) => d.id === tierGid) ?? null;
   const priceKey = tierDef?.key ?? null;
   const qtyKey = priceKey ? `${priceKey}_min` : null;
   const qtyDef = qtyKey ? (defs.find((d) => d.key === qtyKey) ?? null) : null;
+
+  // Fetch the current tier→tags config from the automatic discount metafield.
+  // We need to find the discountNode that has the $app::tier_customer_tags metafield.
+  // The metafield is stored on discountNodes; we fetch via discountNodes query.
+  let savedTierTagsConfig = {};
+  try {
+    const discountMfResponse = await admin.graphql(
+      `#graphql
+        query GetDiscountTierTags {
+          discountNodes(first: 10, query: "status:active") {
+            nodes {
+              id
+              metafield(namespace: "$app", key: "tier_customer_tags") {
+                id
+                value
+              }
+            }
+          }
+        }
+      `
+    );
+    const discountMfData = await discountMfResponse.json();
+    // Find any discount node that has this metafield configured
+    const discountNodes = discountMfData?.data?.discountNodes?.nodes ?? [];
+    for (const node of discountNodes) {
+      if (node.metafield?.value) {
+        try {
+          const parsed = JSON.parse(node.metafield.value);
+          savedTierTagsConfig = parsed.tiers || parsed;
+          break;
+        } catch {
+          // ignore parse error
+        }
+      }
+    }
+  } catch {
+    // non-fatal: if we can't load saved config, start empty
+  }
+
+  const allCustomerTags = tagsData?.data?.shop?.customerTags?.nodes ?? [];
 
   return {
     tierId,
@@ -309,8 +368,11 @@ export const loader = async ({ request }) => {
     currencyCode: data?.data?.shop?.currencyCode ?? "USD",
     products: data?.data?.products?.nodes ?? [],
     pageInfo: data?.data?.products?.pageInfo ?? {},
+    allCustomerTags,
+    savedTierTagsConfig,
   };
 };
+
 
 // ─── Action ───────────────────────────────────────────────────────────────────
 
@@ -460,6 +522,188 @@ export const action = async ({ request }) => {
     return { intent: "save", ok: true, saved: allSaved.length };
   }
 
+  // ── Save tier→customer tag config to the discount node metafield ─────────
+  if (intent === "saveTierTags") {
+    const tierKey = formData.get("tierKey");
+    const tierName = formData.get("tierName") || tierKey;
+    const tagsJson = formData.get("tagsJson");
+    const discountNodeId = formData.get("discountNodeId");
+
+    if (!tierKey) {
+      return { intent: "saveTierTags", ok: false, error: "Missing tier key." };
+    }
+
+    let newTags = [];
+    try {
+      newTags = JSON.parse(tagsJson);
+      if (!Array.isArray(newTags)) newTags = [];
+    } catch {
+      return { intent: "saveTierTags", ok: false, error: "Invalid tags payload." };
+    }
+
+    // Normalize tags: trim, deduplicate, filter empty
+    newTags = [...new Set(newTags.map((t) => String(t).trim()).filter(Boolean))];
+
+    // We need a discountNode to save the metafield on.
+    // If no discountNodeId provided, find an existing active discount node or
+    // use the first available one (the function-based automatic discount).
+    let targetNodeId = discountNodeId || null;
+
+    if (!targetNodeId) {
+      // Find the first discount node associated with our function extension
+      const findResponse = await admin.graphql(
+        `#graphql
+          query FindFunctionDiscountNode {
+            discountNodes(first: 5, query: "status:active") {
+              nodes {
+                id
+                metafield(namespace: "$app", key: "tier_customer_tags") {
+                  id
+                  value
+                }
+              }
+            }
+          }
+        `
+      );
+      const findData = await findResponse.json();
+      const nodes = findData?.data?.discountNodes?.nodes ?? [];
+      // Prefer one that already has our metafield
+      const withMf = nodes.find((n) => n.metafield?.value);
+      targetNodeId = withMf?.id ?? nodes[0]?.id ?? null;
+    }
+
+    if (!targetNodeId) {
+      try {
+        const createResp = await admin.graphql(
+          `#graphql
+            mutation CreateWholesaleDiscount($automaticAppDiscount: DiscountAutomaticAppInput!) {
+              discountAutomaticAppCreate(automaticAppDiscount: $automaticAppDiscount) {
+                automaticAppDiscount {
+                  discountId
+                  title
+                }
+                userErrors {
+                  field
+                  message
+                }
+              }
+            }
+          `,
+          {
+            variables: {
+              automaticAppDiscount: {
+                title: "Wholesale B2B Pricing",
+                functionHandle: "wholesale-price-discount",
+                startsAt: new Date().toISOString(),
+                context: {
+                  all: "ALL"
+                },
+                combinesWith: {
+                  orderDiscounts: true,
+                  productDiscounts: true,
+                  shippingDiscounts: true
+                }
+              },
+            },
+          }
+        );
+        const createData = await createResp.json();
+        targetNodeId = createData?.data?.discountAutomaticAppCreate?.automaticAppDiscount?.discountId ?? null;
+      } catch (err) {
+        console.error("Auto discount creation attempt failed:", err);
+      }
+    }
+
+    if (!targetNodeId) {
+      return {
+        intent: "saveTierTags",
+        ok: false,
+        error: "No active discount found. Please create an automatic discount in Shopify Admin > Discounts using Wholesale Price Discount.",
+      };
+    }
+
+    // Load existing config, merge with new tier tags, write back
+    const readResponse = await admin.graphql(
+      `#graphql
+        query ReadTierTags($id: ID!) {
+          discountNode(id: $id) {
+            metafield(namespace: "$app", key: "tier_customer_tags") {
+              id
+              value
+            }
+          }
+        }
+      `,
+      { variables: { id: targetNodeId } }
+    );
+    const readData = await readResponse.json();
+    let currentConfig = {};
+    const existingMf = readData?.data?.discountNode?.metafield;
+    if (existingMf?.value) {
+      try { currentConfig = JSON.parse(existingMf.value); } catch {}
+    }
+
+    // Merge: update current tier and provide top-level variables for input queries
+    const tiersMap = currentConfig.tiers || { ...currentConfig };
+    const updatedTiersMap = { ...tiersMap, [tierKey]: newTags };
+    if (newTags.length === 0) {
+      delete updatedTiersMap[tierKey];
+    }
+
+    const mergedConfig = {
+      ...currentConfig,
+      ...updatedTiersMap,
+      tiers: updatedTiersMap,
+      tags: newTags,
+      priceKey: tierKey,
+      qtyKey: `${tierKey}_min`,
+      tierName,
+    };
+
+    const saveResponse = await admin.graphql(
+      `#graphql
+        mutation SaveTierTagsMetafield($metafields: [MetafieldsSetInput!]!) {
+          metafieldsSet(metafields: $metafields) {
+            metafields { id key value }
+            userErrors { field message }
+          }
+        }
+      `,
+      {
+        variables: {
+          metafields: [
+            {
+              ownerId: targetNodeId,
+              namespace: "$app",
+              key: "tier_customer_tags",
+              type: "json",
+              value: JSON.stringify(mergedConfig),
+            },
+          ],
+        },
+      }
+    );
+    const saveData = await saveResponse.json();
+    const userErrors = saveData?.data?.metafieldsSet?.userErrors ?? [];
+    if (userErrors.length || saveData.errors?.length) {
+      const msgs = [
+        ...userErrors.map((e) => e.message),
+        ...(saveData.errors ?? []).map((e) => e.message),
+      ];
+      return { intent: "saveTierTags", ok: false, error: msgs.join("; ") };
+    }
+
+    return {
+      intent: "saveTierTags",
+      ok: true,
+      tierKey,
+      savedTags: newTags,
+      discountNodeId: targetNodeId,
+      mergedConfig,
+    };
+  }
+
   return { ok: false, error: "Unknown intent." };
 };
 
@@ -467,7 +711,12 @@ export const action = async ({ request }) => {
 
 export function shouldRevalidate(arg) {
   const intent = arg.formData?.get("intent") || arg.actionResult?.intent;
-  if (intent === "fetchProducts" || intent === "fetchVariants" || intent === "save") {
+  if (
+    intent === "fetchProducts" ||
+    intent === "fetchVariants" ||
+    intent === "save" ||
+    intent === "saveTierTags"
+  ) {
     return false;
   }
   return arg.defaultShouldRevalidate;
@@ -477,8 +726,9 @@ export function shouldRevalidate(arg) {
 
 export default function Pricing() {
   const loaderData = useLoaderData();
-  const { tierDef, priceKey, qtyKey, currencyCode } = loaderData;
+  const { tierDef, priceKey, qtyKey, currencyCode, allCustomerTags, savedTierTagsConfig } = loaderData;
   const fetcher = useFetcher();
+  const tagsFetcher = useFetcher();
 
   // Products and product pagination state
   const [products, setProducts] = useState(loaderData.products ?? []);
@@ -496,6 +746,33 @@ export default function Pricing() {
   const [saving, setSaving] = useState(false);
   const [saveError, setSaveError] = useState(null);
   const [saveSuccess, setSaveSuccess] = useState(false);
+
+  // ── Customer Tag state ───────────────────────────────────────────────────
+  // Tags currently configured for this tier (initialised from saved config)
+  const initialTierTags = (savedTierTagsConfig ?? {})[priceKey] ?? [];
+  const [tierTags, setTierTags] = useState(initialTierTags);
+  const [tagPickerOpen, setTagPickerOpen] = useState(false);
+  const [pickerSearch, setPickerSearch] = useState("");
+  const [customTagInput, setCustomTagInput] = useState("");
+  const [tagsSaving, setTagsSaving] = useState(false);
+  const [tagsSaveError, setTagsSaveError] = useState(null);
+  const [tagsSaveSuccess, setTagsSaveSuccess] = useState(false);
+  // Saved discountNodeId returned after first save (to avoid refetching)
+  const [discountNodeId, setDiscountNodeId] = useState(null);
+
+  // Keep tierTags in sync when loader returns a new savedTierTagsConfig
+  // (e.g. after navigating to a different tier)
+  const prevTierIdRef = useRef(loaderData.tierId);
+  useEffect(() => {
+    if (prevTierIdRef.current !== loaderData.tierId) {
+      prevTierIdRef.current = loaderData.tierId;
+      setTierTags((savedTierTagsConfig ?? {})[priceKey] ?? []);
+      setTagsSaveError(null);
+      setTagsSaveSuccess(false);
+      setDiscountNodeId(null);
+    }
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [loaderData.tierId]);
 
   const pendingFetchRef = useRef(null);
   const pendingSaveRef = useRef(false);
@@ -615,6 +892,9 @@ export default function Pricing() {
       setSaving(false);
       if (fetcher.data.ok) {
         setSaveSuccess(true);
+        if (typeof shopify !== "undefined" && shopify.toast) {
+          shopify.toast.show("Pricing saved successfully!");
+        }
         // Commit: current values become the new baseline original values
         setEdits((prev) => {
           const next = {};
@@ -628,6 +908,29 @@ export default function Pricing() {
       }
     }
   }, [fetcher.data, priceKey, qtyKey]);
+
+  // ── Handle tagsFetcher responses (saveTierTags) ──────────────────────────
+
+  useEffect(() => {
+    if (!tagsFetcher.data) return;
+    if (tagsFetcher.data.intent === "saveTierTags") {
+      setTagsSaving(false);
+      if (tagsFetcher.data.ok) {
+        setTagsSaveSuccess(true);
+        setTagsSaveError(null);
+        // Cache the discountNodeId so subsequent saves are faster
+        if (tagsFetcher.data.discountNodeId) {
+          setDiscountNodeId(tagsFetcher.data.discountNodeId);
+        }
+        if (typeof shopify !== "undefined" && shopify.toast) {
+          shopify.toast.show("Customer tags saved successfully!");
+        }
+      } else {
+        setTagsSaveError(tagsFetcher.data.error ?? "Failed to save tags.");
+      }
+    }
+  }, [tagsFetcher.data]);
+
 
   // ── No tier found guard ──────────────────────────────────────────────────
 
@@ -846,6 +1149,82 @@ export default function Pricing() {
     (e) => String(e.value ?? "") !== String(e.originalValue ?? "")
   );
 
+  // ── Customer Tag Handlers ────────────────────────────────────────────────
+
+  const handleAddCustomTags = () => {
+    if (!customTagInput.trim()) return;
+    const rawTags = customTagInput.split(",");
+    const newTags = rawTags
+      .map((t) => t.trim())
+      .filter((t) => t.length > 0);
+
+    if (newTags.length === 0) return;
+
+    setTierTags((prev) => {
+      const existingLower = new Set(prev.map((t) => t.toLowerCase()));
+      const toAdd = newTags.filter((t) => !existingLower.has(t.toLowerCase()));
+      return [...prev, ...toAdd];
+    });
+
+    setCustomTagInput("");
+    setTagsSaveSuccess(false);
+    setTagsSaveError(null);
+  };
+
+  const handleTogglePickerTag = (tag) => {
+    const trimmed = tag.trim();
+    if (!trimmed) return;
+    setTierTags((prev) => {
+      const exists = prev.some((t) => t.toLowerCase() === trimmed.toLowerCase());
+      if (exists) {
+        return prev.filter((t) => t.toLowerCase() !== trimmed.toLowerCase());
+      } else {
+        return [...prev, trimmed];
+      }
+    });
+    setTagsSaveSuccess(false);
+    setTagsSaveError(null);
+  };
+
+  const handleRemoveTag = (tagToRemove) => {
+    setTierTags((prev) => prev.filter((t) => t !== tagToRemove));
+    setTagsSaveSuccess(false);
+    setTagsSaveError(null);
+  };
+
+  const handleClearAllTags = () => {
+    setTierTags([]);
+    setTagsSaveSuccess(false);
+    setTagsSaveError(null);
+  };
+
+  const handleSaveTierTags = () => {
+    if (tagsSaving) return;
+    setTagsSaving(true);
+    setTagsSaveError(null);
+    setTagsSaveSuccess(false);
+
+    const fd = new FormData();
+    fd.append("intent", "saveTierTags");
+    fd.append("tierKey", priceKey);
+    fd.append("tierName", tierDef?.name ?? priceKey);
+    fd.append("tagsJson", JSON.stringify(tierTags));
+    if (discountNodeId) {
+      fd.append("discountNodeId", discountNodeId);
+    }
+    tagsFetcher.submit(fd, { method: "POST" });
+  };
+
+  const savedTagsForThisTier = (savedTierTagsConfig ?? {})[priceKey] ?? [];
+  const savedTagsSet = new Set(savedTagsForThisTier);
+  const hasTagChanges =
+    tierTags.length !== savedTagsForThisTier.length ||
+    tierTags.some((t) => !savedTagsSet.has(t));
+
+  const filteredCustomerTags = (allCustomerTags || []).filter((tag) =>
+    tag.toLowerCase().includes(pickerSearch.toLowerCase().trim())
+  );
+
   // ── Sync shopify.saveBar with dirty state (hasChanges) ───────────────────
 
   const saveBarId = "pricing-save-bar";
@@ -869,9 +1248,6 @@ export default function Pricing() {
     };
   }, []);
 
-  // show toast
-    if(saveSuccess) shopify.toast.show('Saved Successfully');
-
   // ── Render ───────────────────────────────────────────────────────────────
 
   return (
@@ -894,6 +1270,173 @@ export default function Pricing() {
 
       {saveError && <s-banner tone="critical">{saveError}</s-banner>}
       {saveSuccess && <s-banner tone="success">Pricing saved successfully!</s-banner>}
+
+      {/* ── Customer Tags Section ────────────────────────────────────────── */}
+      <s-section heading="Eligible Customer Tags">
+        <s-stack direction="block" gap="base">
+          <s-text tone="subdued">
+            Select or enter customer tags for this tier. Logged-in customers with any of these tags will automatically receive <strong>{tierDef.name}</strong> pricing at checkout.
+            These tags are saved to the Shopify discount function metafield.
+          </s-text>
+
+          {tagsSaveError && (
+            <s-banner tone="critical">{tagsSaveError}</s-banner>
+          )}
+          {tagsSaveSuccess && (
+            <s-banner tone="success">Customer tags for {tierDef.name} saved successfully!</s-banner>
+          )}
+
+          {/* Action Row: Picker toggle, Custom Tag input, and Save button */}
+          <s-stack direction="inline" gap="base" alignItems="end" wrap>
+            <s-button
+              variant="secondary"
+              onClick={() => setTagPickerOpen((prev) => !prev)}
+            >
+              {tagPickerOpen
+                ? "Close Tag Picker"
+                : `Select Store Tags (${allCustomerTags.length})`}
+            </s-button>
+
+            <s-stack direction="inline" gap="small" alignItems="center" inlineSize="fill" maxInlineSize="460px">
+              <s-text-field
+                label="Custom Tags (comma separated)"
+                placeholder="e.g. wholesale, b2b_vip, gold_member"
+                value={customTagInput}
+                onChange={(e) => setCustomTagInput(e.currentTarget?.value ?? e.target?.value ?? "")}
+                onKeyDown={(e) => {
+                  if (e.key === "Enter") {
+                    e.preventDefault();
+                    handleAddCustomTags();
+                  }
+                }}
+              />
+              <s-button
+                variant="secondary"
+                onClick={handleAddCustomTags}
+                disabled={!customTagInput.trim()}
+              >
+                Add
+              </s-button>
+            </s-stack>
+
+            <s-button
+              variant="primary"
+              onClick={handleSaveTierTags}
+              disabled={tagsSaving || (!hasTagChanges && tagsSaveSuccess)}
+              loading={tagsSaving}
+            >
+              {tagsSaving ? "Saving..." : "Save Customer Tags"}
+            </s-button>
+          </s-stack>
+
+          {/* Tag Picker Panel */}
+          {tagPickerOpen && (
+            <s-box
+              padding="base"
+              borderRadius="base"
+              border="base"
+            >
+              <s-stack direction="block" gap="small">
+                <s-stack direction="inline" justifyContent="space-between" alignItems="center">
+                  <s-text type="strong">Existing Customer Tags ({allCustomerTags.length})</s-text>
+                  <s-button
+                    variant="tertiary"
+                    onClick={() => setTagPickerOpen(false)}
+                  >
+                    Done
+                  </s-button>
+                </s-stack>
+
+                <s-text-field
+                  placeholder="Filter store tags..."
+                  value={pickerSearch}
+                  onChange={(e) => setPickerSearch(e.currentTarget?.value ?? e.target?.value ?? "")}
+                />
+
+                {filteredCustomerTags.length === 0 ? (
+                  <s-box padding="small">
+                    <s-text tone="subdued">
+                      {allCustomerTags.length === 0
+                        ? "No customer tags found in store. You can add custom tags using the field above."
+                        : "No matching tags found."}
+                    </s-text>
+                  </s-box>
+                ) : (
+                  <s-stack direction="inline" gap="small" wrap>
+                    {filteredCustomerTags.map((tag) => {
+                      const isSelected = tierTags.some(
+                        (t) => t.toLowerCase() === tag.toLowerCase()
+                      );
+                      return (
+                        <s-clickable
+                          key={tag}
+                          padding="small-300"
+                          borderRadius="base"
+                          border="base"
+                          onClick={() => handleTogglePickerTag(tag)}
+                        >
+                          <s-stack direction="inline" gap="small-300" alignItems="center">
+                            <s-text type={isSelected ? "strong" : "generic"}>
+                              {isSelected ? "✓ " : "+ "}
+                              {tag}
+                            </s-text>
+                          </s-stack>
+                        </s-clickable>
+                      );
+                    })}
+                  </s-stack>
+                )}
+              </s-stack>
+            </s-box>
+          )}
+
+          {/* Configured Tags List Display */}
+          <s-stack direction="block" gap="small">
+            <s-stack direction="inline" gap="small" alignItems="center" justifyContent="space-between">
+              <s-stack direction="inline" gap="small" alignItems="center">
+                <s-text type="strong">
+                  Configured Tags ({tierTags.length}):
+                </s-text>
+                {hasTagChanges && (
+                  <s-badge tone="attention">Unsaved tag changes</s-badge>
+                )}
+              </s-stack>
+              {tierTags.length > 0 && (
+                <s-button variant="tertiary" onClick={handleClearAllTags}>
+                  Clear All Tags
+                </s-button>
+              )}
+            </s-stack>
+
+            {tierTags.length === 0 ? (
+              <s-box padding="base" border="base" borderRadius="base">
+                <s-text tone="subdued">
+                  No tags configured for {tierDef.name}. Select from store tags or add custom comma-separated tags above.
+                </s-text>
+              </s-box>
+            ) : (
+              <s-stack direction="inline" gap="small" wrap alignItems="center">
+                {tierTags.map((tag) => (
+                  <s-badge key={tag} tone="info">
+                    <s-stack direction="inline" gap="small-200" alignItems="center">
+                      <s-text>{tag}</s-text>
+                      <s-clickable
+                        role="button"
+                        aria-label={`Remove tag ${tag}`}
+                        onClick={() => handleRemoveTag(tag)}
+                      >
+                        <s-text type="strong" tone="critical"> × </s-text>
+                      </s-clickable>
+                    </s-stack>
+                  </s-badge>
+                ))}
+              </s-stack>
+            )}
+          </s-stack>
+        </s-stack>
+      </s-section>
+
+      {/* ── Products Pricing Table Section ───────────────────────────────── */}
       <s-section>
 
         <s-table>
