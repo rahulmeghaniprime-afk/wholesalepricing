@@ -27,10 +27,20 @@ function editKey(variantId, mfKey) {
   return `${variantId}::${mfKey}`;
 }
 
+function getProductVariantsList(prod) {
+  if (Array.isArray(prod?.variants?.nodes) && prod.variants.nodes.length > 0) {
+    return prod.variants.nodes;
+  }
+  if (Array.isArray(prod?.variants?.edges) && prod.variants.edges.length > 0) {
+    return prod.variants.edges.map((e) => e.node).filter(Boolean);
+  }
+  return [];
+}
+
 function mergeVariantsIntoEdits(editsMap, productsList, priceKey, qtyKey) {
   const nextEdits = { ...editsMap };
   for (const prod of productsList) {
-    const variants = prod.variants?.nodes ?? [];
+    const variants = getProductVariantsList(prod);
     for (const v of variants) {
       if (priceKey) {
         const pk = editKey(v.id, priceKey);
@@ -74,9 +84,10 @@ function ProductRow({
   onQtyChange,
   disabled,
 }) {
-  const count = product.variantsCount?.count ?? product.variants?.nodes?.length ?? 1;
+  const variants = getProductVariantsList(product);
+  const count = product.variantsCount?.count ?? variants.length ?? 1;
   const isSingle = count === 1;
-  const singleVariant = isSingle ? product.variants?.nodes?.[0] : null;
+  const singleVariant = isSingle ? variants[0] : null;
   const imageUrl = product?.media?.nodes?.[0]?.preview?.image?.url;
 
   return (
@@ -435,6 +446,109 @@ export const action = async ({ request }) => {
     };
   }
 
+  // Search products with query
+  if (intent === "searchProducts") {
+    const query = formData.get("query") || "";
+    const after = formData.get("after") || null;
+    const first = formData.get("first") ? parseInt(formData.get("first"), 10) : 10;
+    const searchResponse = await admin.graphql(
+      `#graphql
+        query SearchProducts($query: String!, $first: Int = 10, $after: String) {
+          products(first: $first, query: $query, after: $after) {
+            nodes {
+              id
+              title
+              handle
+              media(first: 1) {
+                nodes {
+                  preview {
+                    image {
+                      url
+                    }
+                  }
+                }
+              }
+              priceRangeV2 {
+                maxVariantPrice {
+                  amount
+                }
+                minVariantPrice {
+                  amount
+                }
+              }
+              variantsCount {
+                count
+              }
+              variants(first: 50) {
+                edges {
+                  node {
+                    id
+                    sku
+                    title
+                    price
+                    metafields(namespace: "$app", first: 100) {
+                      nodes {
+                        id
+                        key
+                        type
+                        value
+                      }
+                    }
+                  }
+                }
+                nodes {
+                  id
+                  sku
+                  title
+                  price
+                  metafields(namespace: "$app", first: 100) {
+                    nodes {
+                      id
+                      key
+                      type
+                      value
+                    }
+                  }
+                }
+                pageInfo {
+                  endCursor
+                  hasNextPage
+                  hasPreviousPage
+                  startCursor
+                }
+              }
+            }
+            pageInfo {
+              endCursor
+              hasNextPage
+              hasPreviousPage
+              startCursor
+            }
+          }
+        }
+      `,
+      { variables: { query, first, after } }
+    );
+    const searchData = await searchResponse.json();
+    if (searchData.errors?.length) {
+      return {
+        intent: "searchProducts",
+        ok: false,
+        error: searchData.errors.map((e) => e.message).join(", "),
+        products: [],
+        pageInfo: {},
+        query,
+      };
+    }
+    return {
+      intent: "searchProducts",
+      ok: true,
+      products: searchData?.data?.products?.nodes ?? [],
+      pageInfo: searchData?.data?.products?.pageInfo ?? {},
+      query,
+    };
+  }
+
   // Fetch paginated variants for an expanded product
   if (intent === "fetchVariants") {
     const productId = formData.get("productId");
@@ -641,7 +755,11 @@ export const action = async ({ request }) => {
     let currentConfig = {};
     const existingMf = readData?.data?.discountNode?.metafield;
     if (existingMf?.value) {
-      try { currentConfig = JSON.parse(existingMf.value); } catch {}
+      try {
+        currentConfig = JSON.parse(existingMf.value);
+      } catch {
+        // ignore JSON parse error for malformed config
+      }
     }
 
     // Merge: update current tier and provide top-level variables for input queries
@@ -713,6 +831,7 @@ export function shouldRevalidate(arg) {
   const intent = arg.formData?.get("intent") || arg.actionResult?.intent;
   if (
     intent === "fetchProducts" ||
+    intent === "searchProducts" ||
     intent === "fetchVariants" ||
     intent === "save" ||
     intent === "saveTierTags"
@@ -735,6 +854,14 @@ export default function Pricing() {
   const [productPageInfo, setProductPageInfo] = useState(loaderData.pageInfo ?? {});
   const [productCursorHistory, setProductCursorHistory] = useState([null]);
   const [productPageLoading, setProductPageLoading] = useState(false);
+
+  // Search state
+  const [searchQuery, setSearchQuery] = useState("");
+  const [activeSearchQuery, setActiveSearchQuery] = useState("");
+  const activeSearchQueryRef = useRef("");
+  const debounceTimerRef = useRef(null);
+  const defaultProductsRef = useRef(loaderData.products ?? []);
+  const defaultPageInfoRef = useRef(loaderData.pageInfo ?? {});
 
   // Edit state: compositeKey → { value, originalValue, type, key, ownerId }
   const [edits, setEdits] = useState(() =>
@@ -784,6 +911,14 @@ export default function Pricing() {
   useEffect(() => {
     if (currentTierIdRef.current !== loaderData.tierId) {
       currentTierIdRef.current = loaderData.tierId;
+      defaultProductsRef.current = loaderData.products ?? [];
+      defaultPageInfoRef.current = loaderData.pageInfo ?? {};
+      setSearchQuery("");
+      setActiveSearchQuery("");
+      activeSearchQueryRef.current = "";
+      if (debounceTimerRef.current) {
+        clearTimeout(debounceTimerRef.current);
+      }
       setProducts(loaderData.products ?? []);
       setProductPageInfo(loaderData.pageInfo ?? {});
       setProductCursorHistory([null]);
@@ -792,13 +927,31 @@ export default function Pricing() {
     }
   }, [loaderData.tierId, loaderData.products, loaderData.pageInfo, priceKey, qtyKey]);
 
+  useEffect(() => {
+    return () => {
+      if (debounceTimerRef.current) {
+        clearTimeout(debounceTimerRef.current);
+      }
+    };
+  }, []);
+
   // ── Handle fetcher responses ─────────────────────────────────────────────
 
   useEffect(() => {
     if (!fetcher.data) return;
 
-    // Handle product-level pagination responses
-    if (fetcher.data.intent === "fetchProducts") {
+    // Handle product-level pagination responses or search responses
+    if (fetcher.data.intent === "fetchProducts" || fetcher.data.intent === "searchProducts") {
+      if (fetcher.data.intent === "searchProducts") {
+        if (activeSearchQueryRef.current !== (fetcher.data.query ?? "")) {
+          // Ignore stale search response
+          return;
+        }
+      } else if (activeSearchQueryRef.current) {
+        // Ignore default fetch response while search is active
+        return;
+      }
+
       setProductPageLoading(false);
       const pending = pendingProductFetchRef.current;
       pendingProductFetchRef.current = null;
@@ -815,6 +968,8 @@ export default function Pricing() {
         setProductCursorHistory((prev) => [...prev, pending.cursor]);
       } else if (pending?.direction === "prev") {
         setProductCursorHistory((prev) => (prev.length > 1 ? prev.slice(0, -1) : prev));
+      } else if (pending?.direction === "reset") {
+        setProductCursorHistory([null]);
       }
 
       // Merge new products into edits (preserving already-edited values)
@@ -932,20 +1087,6 @@ export default function Pricing() {
   }, [tagsFetcher.data]);
 
 
-  // ── No tier found guard ──────────────────────────────────────────────────
-
-  if (!tierDef || !priceKey) {
-    return (
-      <s-page heading="B2B Pricing">
-        <s-section>
-          <s-banner tone="critical">
-            Pricing tier not found. Please go back to Tier Pricings and select a valid tier.
-          </s-banner>
-        </s-section>
-      </s-page>
-    );
-  }
-
   // ── Value getters ────────────────────────────────────────────────────────
 
   const getPriceValue = (variant) => {
@@ -1009,9 +1150,15 @@ export default function Pricing() {
     setProductPageLoading(true);
     setSaveError(null);
     setSaveSuccess(false);
-    pendingProductFetchRef.current = { cursor, direction };
+    pendingProductFetchRef.current = { cursor, direction, query: activeSearchQuery };
     const fd = new FormData();
-    fd.append("intent", "fetchProducts");
+    if (activeSearchQuery) {
+      fd.append("intent", "searchProducts");
+      fd.append("query", activeSearchQuery);
+      fd.append("first", "10");
+    } else {
+      fd.append("intent", "fetchProducts");
+    }
     if (cursor) {
       fd.append("after", cursor);
     }
@@ -1030,6 +1177,42 @@ export default function Pricing() {
     loadProductPage(prevCursor, "prev");
   };
 
+  // ── Debounced Search Handler ──────────────────────────────────────────────
+
+  const handleSearchChange = (val) => {
+    setSearchQuery(val);
+    if (debounceTimerRef.current) {
+      clearTimeout(debounceTimerRef.current);
+    }
+    debounceTimerRef.current = setTimeout(() => {
+      const trimmed = val.trim();
+      if (!trimmed) {
+        // Query is blank or removed -> show default as current
+        activeSearchQueryRef.current = "";
+        setActiveSearchQuery("");
+        setProductPageLoading(false);
+        setProductCursorHistory([null]);
+        setProducts(defaultProductsRef.current);
+        setProductPageInfo(defaultPageInfoRef.current);
+        setSaveError(null);
+        return;
+      }
+
+      // Query present -> execute SearchProducts
+      activeSearchQueryRef.current = trimmed;
+      setActiveSearchQuery(trimmed);
+      setProductPageLoading(true);
+      setSaveError(null);
+      setSaveSuccess(false);
+      pendingProductFetchRef.current = { direction: "reset", cursor: null, query: trimmed };
+      const fd = new FormData();
+      fd.append("intent", "searchProducts");
+      fd.append("query", trimmed);
+      fd.append("first", "10");
+      fetcher.submit(fd, { method: "POST" });
+    }, 300);
+  };
+
   // ── Variant-level Expansion & Pagination ──────────────────────────────────
 
   const toggleVariants = (product) => {
@@ -1042,10 +1225,11 @@ export default function Pricing() {
       });
       return;
     }
+    const variantsList = getProductVariantsList(product);
     setExpandedProducts((prev) => ({
       ...prev,
       [pid]: {
-        variants: product.variants?.nodes ?? [],
+        variants: variantsList,
         pageInfo: product.variants?.pageInfo ?? {},
         cursorHistory: [null],
         pageLoading: false,
@@ -1250,6 +1434,18 @@ export default function Pricing() {
 
   // ── Render ───────────────────────────────────────────────────────────────
 
+  if (!tierDef || !priceKey) {
+    return (
+      <s-page heading="B2B Pricing">
+        <s-section>
+          <s-banner tone="critical">
+            Pricing tier not found. Please go back to Tier Pricings and select a valid tier.
+          </s-banner>
+        </s-section>
+      </s-page>
+    );
+  }
+
   return (
     <s-page heading={`${tierDef.name} — B2B Pricing`}>
       <ui-save-bar id={saveBarId}>
@@ -1438,6 +1634,20 @@ export default function Pricing() {
 
       {/* ── Products Pricing Table Section ───────────────────────────────── */}
       <s-section>
+        <s-box paddingBlockEnd="base">
+          <s-search-field
+            label="Search"
+            labelAccessibilityVisibility="exclusive"
+            placeholder="Search items"
+            value={searchQuery}
+            onInput={(e) =>
+              handleSearchChange(e.currentTarget?.value ?? e.target?.value ?? "")
+            }
+            onChange={(e) =>
+              handleSearchChange(e.currentTarget?.value ?? e.target?.value ?? "")
+            }
+          ></s-search-field>
+        </s-box>
 
         <s-table>
           <s-table-header-row>
@@ -1453,7 +1663,11 @@ export default function Pricing() {
               <s-table-row>
                 <s-table-cell colSpan={qtyKey ? 5 : 4}>
                   <s-box padding="base">
-                    <s-text tone="subdued">No products found.</s-text>
+                    <s-text tone="subdued">
+                      {activeSearchQuery
+                        ? `No products found matching "${activeSearchQuery}".`
+                        : "No products found."}
+                    </s-text>
                   </s-box>
                 </s-table-cell>
               </s-table-row>
@@ -1549,12 +1763,16 @@ export default function Pricing() {
         >
           <s-stack direction="inline" gap="small" alignItems="center">
             <s-text tone="subdued">
-              Product Page {productCursorHistory.length}
+              {activeSearchQuery
+                ? `Search Page ${productCursorHistory.length}`
+                : `Product Page ${productCursorHistory.length}`}
             </s-text>
             {productPageLoading && (
               <s-stack direction="inline" gap="small" alignItems="center">
                 <s-spinner size="small" />
-                <s-text tone="subdued">Loading products...</s-text>
+                <s-text tone="subdued">
+                  {activeSearchQuery ? "Searching products..." : "Loading products..."}
+                </s-text>
               </s-stack>
             )}
           </s-stack>
